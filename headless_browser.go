@@ -22,6 +22,15 @@ type Browser struct {
 	launcher  *launcher.Launcher
 	stealthJS bool // NewPage 是否注入 go-rod/stealth 的 JS 补丁
 
+	// keepUserDataDir is set when the caller supplied an explicit user data
+	// directory via WithUserDataDir. Close() then refuses to delete it.
+	keepUserDataDir bool
+
+	// pageHook runs on every page created by NewPage, after the UA override
+	// is applied. Typically used for per-page CDP setup such as
+	// Emulation.setDeviceMetricsOverride. nil = no hook.
+	pageHook func(*rod.Page) error
+
 	// uaOverride：每个新页面套用的一致 UA/Client-Hints 覆盖。
 	// go-rod 建页面时 CloakBrowser 的 UA 版本补丁不激活（页面退回旧版 UA、uaFullVersion 空），
 	// 这里用浏览器实读的真实版本 + 平台补丁实读的 platform 三项拼出自洽元数据补回。nil = 不覆盖。
@@ -55,6 +64,19 @@ type Config struct {
 	// "fingerprint-brand":"Chrome"、"fingerprint-hardware-concurrency":"8"）。
 	// 键不带前导 "--"。
 	ExtraFlags map[string]string
+
+	// UserDataDir is the Chrome profile directory (--user-data-dir). When set,
+	// the profile persists across runs and Close() will not delete it.
+	// Empty = rod picks a temp directory and removes it on Close().
+	UserDataDir string
+
+	// LauncherHook runs against the launcher after every other flag has been
+	// applied and before MustLaunch. Use it to Delete flags, set Env or
+	// Preferences, or reach anything else rod's launcher exposes.
+	LauncherHook func(*launcher.Launcher)
+
+	// PageHook runs on every page returned by NewPage, after the UA override.
+	PageHook func(*rod.Page) error
 
 	Trace bool // Whether to enable tracing (not implemented yet)
 }
@@ -159,6 +181,77 @@ func WithExtraFlags(flags map[string]string) Option {
 	}
 }
 
+// WithUserDataDir sets an explicit Chrome profile directory (--user-data-dir).
+//
+// Besides passing the flag to the launcher, it marks the directory as owned by
+// the caller: Close() then skips launcher.Cleanup()'s unconditional
+// os.RemoveAll of the user data dir, so cookies, local storage and the rest of
+// the profile survive a clean shutdown.
+//
+// Note that rod's flags.KeepUserDataDir ("rod-keep-user-data-dir") does not
+// help here: it is only honoured by the remote launcher Manager, never by the
+// local Cleanup path.
+func WithUserDataDir(dir string) Option {
+	return func(c *Config) {
+		c.UserDataDir = dir
+	}
+}
+
+// WithLauncherHook registers a callback invoked with the rod launcher after all
+// other flags have been applied and immediately before MustLaunch.
+//
+// This is the general escape hatch for anything this package does not wrap, for
+// example:
+//
+//	WithLauncherHook(func(l *launcher.Launcher) {
+//		l.Delete("enable-automation")
+//		l.Env("LANG=zh_CN.UTF-8")
+//		l.Preferences(`{"profile":{"exit_type":"Normal"}}`)
+//	})
+//
+// Hooks are applied in the order the options were given.
+func WithLauncherHook(hook func(*launcher.Launcher)) Option {
+	return func(c *Config) {
+		if hook == nil {
+			return
+		}
+		prev := c.LauncherHook
+		if prev == nil {
+			c.LauncherHook = hook
+			return
+		}
+		c.LauncherHook = func(l *launcher.Launcher) {
+			prev(l)
+			hook(l)
+		}
+	}
+}
+
+// WithPageHook registers a callback run on every page created by NewPage, after
+// the consistent UA override (if any) has been applied. Use it for per-page CDP
+// setup, such as proto.EmulationSetDeviceMetricsOverride for window geometry.
+//
+// An error returned by the hook is logged and does not abort page creation.
+// Hooks are applied in the order the options were given.
+func WithPageHook(hook func(*rod.Page) error) Option {
+	return func(c *Config) {
+		if hook == nil {
+			return
+		}
+		prev := c.PageHook
+		if prev == nil {
+			c.PageHook = hook
+			return
+		}
+		c.PageHook = func(p *rod.Page) error {
+			if err := prev(p); err != nil {
+				return err
+			}
+			return hook(p)
+		}
+	}
+}
+
 func WithTrace() Option {
 	return func(c *Config) {
 		c.Trace = true
@@ -221,6 +314,16 @@ func New(options ...Option) *Browser {
 		l = l.Proxy(cfg.Proxy)
 	}
 
+	// Persistent profile directory, if the caller supplied one.
+	if cfg.UserDataDir != "" {
+		l = l.UserDataDir(cfg.UserDataDir)
+	}
+
+	// Last chance for the caller to touch the launcher before it starts.
+	if cfg.LauncherHook != nil {
+		cfg.LauncherHook(l)
+	}
+
 	url := l.MustLaunch()
 
 	browser := rod.New().
@@ -239,9 +342,11 @@ func New(options ...Option) *Browser {
 	}
 
 	b := &Browser{
-		browser:   browser,
-		launcher:  l,
-		stealthJS: cfg.StealthJS,
+		browser:         browser,
+		launcher:        l,
+		stealthJS:       cfg.StealthJS,
+		keepUserDataDir: cfg.UserDataDir != "",
+		pageHook:        cfg.PageHook,
 	}
 
 	// 启用指纹时，构建一致 UA 覆盖，补回 go-rod 建页面丢失的 UA 版本保真度
@@ -308,9 +413,24 @@ func primaryLang(lang string) string {
 	return lang
 }
 
+// Rod returns the underlying rod.Browser, for browser-level CDP calls that this
+// package does not wrap.
+func (b *Browser) Rod() *rod.Browser {
+	return b.browser
+}
+
 // Close closes the browser and cleans up resources.
+//
+// launcher.Cleanup waits for the browser process to exit and then does an
+// unconditional os.RemoveAll of the user data dir. When the caller supplied the
+// directory (WithUserDataDir) we drop the flag from the launcher first, which
+// makes Cleanup's RemoveAll a no-op (os.RemoveAll("") returns nil) while still
+// waiting for the process to exit.
 func (b *Browser) Close() {
 	b.browser.MustClose()
+	if b.keepUserDataDir {
+		b.launcher.Delete(flags.UserDataDir)
+	}
 	b.launcher.Cleanup()
 }
 
@@ -328,6 +448,13 @@ func (b *Browser) NewPage() *rod.Page {
 	if b.uaOverride != nil {
 		if err := b.uaOverride.Call(page); err != nil {
 			logrus.Warnf("apply UA override failed: %v", err)
+		}
+	}
+
+	// Caller-supplied per-page CDP setup.
+	if b.pageHook != nil {
+		if err := b.pageHook(page); err != nil {
+			logrus.Warnf("page hook failed: %v", err)
 		}
 	}
 	return page

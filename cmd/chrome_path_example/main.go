@@ -6,8 +6,8 @@ import (
 	"log"
 	"runtime"
 
+	headless_browser "github.com/alex-soldatkin/headless_browser"
 	"github.com/go-rod/rod/lib/launcher"
-	headless_browser "github.com/xpzouying/headless_browser"
 )
 
 func main() {

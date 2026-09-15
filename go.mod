@@ -1,4 +1,4 @@
-module github.com/xpzouying/headless_browser
+module github.com/alex-soldatkin/headless_browser
 
 go 1.23.1
 
